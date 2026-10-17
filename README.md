@@ -9,10 +9,10 @@ An automated security and compliance audit tool built to govern AI-generated cod
 - **Dual Reporting:** Outputs color-coded terminal alerts and machine-readable JSON logs for automated CI/CD pipelines.
 
 ## Usage
-# Developer CLI Scan
+### Developer CLI Scan
 python guardrail.py sample_insecure_code.py
 
-# Machine-Readable JSON Export
+### Machine-Readable JSON Export
 python guardrail.py sample_insecure_code.py --format json > audit_report.json
 
 
