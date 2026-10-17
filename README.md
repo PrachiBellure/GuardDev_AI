@@ -7,9 +7,16 @@ An automated security and compliance audit tool built to govern AI-generated cod
 - **Static AST Analysis (MAP):** Flags dangerous dynamic execution (`eval`, `exec`), command injection (`shell=True`), and SQL injection patterns.
 - **Supply-Chain Verification (MEASURE):** Identifies potential AI hallucinated imports and unpinned third-party dependencies.
 - **Dual Reporting:** Outputs color-coded terminal alerts and machine-readable JSON logs for automated CI/CD pipelines.
+  
+##  Verification & Proof of Execution
+### Interactive Web Audit Console
+![Streamlit Input](dashboard_input.png)
+![Streamlit Audit Results](dashboard_audit.png)
+
+### CLI & Pre-Commit Engine
+![CLI Detection](cli_detection.png)
 
 ## Usage
-
 # Developer CLI Scan
 python guardrail.py sample_insecure_code.py
 
