@@ -1,195 +1,239 @@
-import argparse
 import ast
 import json
+import math
 import os
 import re
 import sys
-from typing import Dict, List, Any
 
-# Standard Regex patterns for sensitive credentials & tokens
-SECRET_PATTERNS = {
-    "AWS Access Key": re.compile(r"(?:A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}"),
-    "OpenAI Secret Key": re.compile(r"sk-[a-zA-Z0-9]{20,48}"),
-    "Generic API Key / Secret": re.compile(r"""(?i)(?:api_key|apikey|secret|token|password)\s*[:=]\s*['"][a-zA-Z0-9_\-]{16,}['"]"""),
-    "Private Key Header": re.compile(r"-----BEGIN (?:RSA |EC )?PRIVATE KEY-----")
+# Comprehensive signature patterns for arbitrary secrets
+SECRET_KEYWORD_REGEX = re.compile(
+    r'(?i)(secret|token|api_?key|auth|password|passwd|pwd|access_?key|private_?key|client_?secret|conn_?str|database_?url)'
+)
+
+KNOWN_SECRET_PATTERNS = [
+    re.compile(r'AKIA[0-9A-Z]{16}'),                                  # AWS Access Key ID
+    re.compile(r'sk-[a-zA-Z0-9]{20,}'),                              # OpenAI / Standard service keys
+    re.compile(r'gh[pousr]_[A-Za-z0-9_]{36,255}'),                   # GitHub Tokens
+    re.compile(r'xox[baprs]-[0-9a-zA-Z]{10,48}'),                    # Slack Tokens
+    re.compile(r'eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}'),         # JWT Tokens
+    re.compile(r'-----BEGIN (RSA|EC|DSA|OPENSSH) PRIVATE KEY-----'), # Private Keys
+]
+
+# Baseline standard dependencies (flags unverified/hallucinated external imports)
+STANDARD_OR_APPROVED_PKGS = {
+    "os", "sys", "re", "math", "json", "ast", "tempfile", "subprocess", "datetime",
+    "collections", "itertools", "pathlib", "typing", "sqlite3", "pandas", "streamlit",
+    "requests", "numpy", "dotenv", "pydantic", "fastapi", "flask"
 }
 
-RISKY_FUNCS = {
-    "eval": ("CWE-95", "Execution of dynamic code using eval()."),
-    "exec": ("CWE-95", "Execution of arbitrary code using exec()."),
-    "system": ("CWE-78", "Potential command injection via os.system()."),
-    "popen": ("CWE-78", "Potential command injection via os.popen().")
-}
+def calculate_shannon_entropy(data: str) -> float:
+    """Calculates the Shannon entropy of a string to detect high-randomness tokens."""
+    if not data:
+        return 0.0
+    entropy = 0.0
+    for x in set(data):
+        p_x = float(data.count(x)) / len(data)
+        entropy += - p_x * math.log2(p_x)
+    return entropy
 
 class SecurityScanner(ast.NodeVisitor):
-    def __init__(self, filepath: str, lines: List[str]):
-        self.filepath = filepath
-        self.lines = lines
-        self.findings: List[Dict[str, Any]] = []
+    def __init__(self, filename="<input>"):
+        self.filename = filename
+        self.violations = []
 
-    def visit_Call(self, node: ast.Call):
-        func_name = None
-        if isinstance(node.func, ast.Name):
-            func_name = node.func.id
-        elif isinstance(node.func, ast.Attribute):
-            func_name = node.func.attr
+    def visit_Import(self, node):
+        """CWE-1104: Scan standard imports for untracked or hallucinated packages."""
+        for alias in node.names:
+            pkg = alias.name.split('.')[0]
+            if pkg not in STANDARD_OR_APPROVED_PKGS:
+                self.violations.append({
+                    "category": "Unverified Dependency",
+                    "cwe": "CWE-1104",
+                    "nist_rmf": "MAP",
+                    "severity": "MEDIUM",
+                    "file": self.filename,
+                    "line": node.lineno,
+                    "description": f"Unverified or potential hallucinated dependency '{pkg}'.",
+                    "snippet": f"import {alias.name}"
+                })
+        self.generic_visit(node)
 
-        if func_name in RISKY_FUNCS:
-            cwe, desc = RISKY_FUNCS[func_name]
-            self.findings.append({
-                "category": "Dangerous Function",
-                "cwe": cwe,
-                "nist_rmf": "MAP",
-                "severity": "HIGH",
-                "file": self.filepath,
-                "line": node.lineno,
-                "description": desc,
-                "snippet": self.lines[node.lineno - 1].strip()
-            })
+    def visit_ImportFrom(self, node):
+        """CWE-1104: Scan from-imports for untracked or hallucinated packages."""
+        if node.module:
+            pkg = node.module.split('.')[0]
+            if pkg not in STANDARD_OR_APPROVED_PKGS:
+                self.violations.append({
+                    "category": "Unverified Dependency",
+                    "cwe": "CWE-1104",
+                    "nist_rmf": "MAP",
+                    "severity": "MEDIUM",
+                    "file": self.filename,
+                    "line": node.lineno,
+                    "description": f"Unverified or potential hallucinated dependency '{pkg}'.",
+                    "snippet": f"from {node.module} import ..."
+                })
+        self.generic_visit(node)
 
-        # Check for subprocess.call/Popen with shell=True
-        if func_name in ["call", "Popen", "run"]:
-            for keyword in node.keywords:
-                if keyword.arg == "shell" and isinstance(keyword.value, ast.Constant) and keyword.value.value is True:
-                    self.findings.append({
-                        "category": "Subprocess Shell Execution",
-                        "cwe": "CWE-78",
-                        "nist_rmf": "MAP",
+    def visit_Assign(self, node):
+        """CWE-798: Arbitrary exposed credential detection using heuristics, patterns & entropy."""
+        target_names = []
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                target_names.append(target.id)
+            elif isinstance(target, ast.Attribute):
+                target_names.append(target.attr)
+
+        string_val = None
+        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            string_val = node.value.value
+        elif hasattr(ast, "Str") and isinstance(node.value, ast.Str):
+            string_val = node.value.s
+
+        if string_val:
+            val_clean = string_val.strip()
+            if len(val_clean) > 6 and not val_clean.startswith("${") and not val_clean.startswith("env:"):
+                matches_pattern = any(pattern.search(val_clean) for pattern in KNOWN_SECRET_PATTERNS)
+                matches_var_name = any(SECRET_KEYWORD_REGEX.search(name) for name in target_names)
+                entropy = calculate_shannon_entropy(val_clean)
+                is_high_entropy = len(val_clean) >= 16 and entropy >= 3.2
+
+                if matches_pattern or (matches_var_name and len(val_clean) >= 8) or (matches_var_name and is_high_entropy):
+                    masked = val_clean[:4] + "*" * (len(val_clean) - 6) + val_clean[-2:] if len(val_clean) > 8 else "********"
+                    target_str = ", ".join(target_names) if target_names else "unnamed_variable"
+                    self.violations.append({
+                        "category": "Exposed Hardcoded Credential",
+                        "cwe": "CWE-798",
+                        "nist_rmf": "GOVERN",
                         "severity": "CRITICAL",
-                        "file": self.filepath,
+                        "file": self.filename,
                         "line": node.lineno,
-                        "description": "subprocess invoked with shell=True, enabling shell injection.",
-                        "snippet": self.lines[node.lineno - 1].strip()
+                        "description": f"Exposed credential or secret key assigned to '{target_str}'.",
+                        "snippet": f"{target_str} = \"{masked}\""
                     })
 
-        # Check for unparameterized SQL queries via f-strings
-        if func_name == "execute" and node.args:
-            first_arg = node.args[0]
-            if isinstance(first_arg, ast.JoinedStr):
-                self.findings.append({
-                    "category": "Unparameterized SQL Query",
-                    "cwe": "CWE-89",
+        self.generic_visit(node)
+
+    def visit_Call(self, node):
+        """CWE-78 / CWE-95 / CWE-89: Detection of dangerous runtime commands and injections."""
+        # 1. Check for eval(), exec()
+        if isinstance(node.func, ast.Name):
+            func_name = node.func.id
+            if func_name in ("eval", "exec"):
+                self.violations.append({
+                    "category": "Dynamic Code Execution",
+                    "cwe": "CWE-95",
                     "nist_rmf": "MAP",
-                    "severity": "HIGH",
-                    "file": self.filepath,
-                    "line": node.lineno,
-                    "description": "SQL query built with f-string interpolation. Risk of SQL Injection.",
-                    "snippet": self.lines[node.lineno - 1].strip()
-                })
-
-        self.generic_visit(node)
-
-    def visit_Import(self, node: ast.Import):
-        for alias in node.names:
-            self._verify_import(alias.name, node.lineno)
-        self.generic_visit(node)
-
-    def visit_ImportFrom(self, node: ast.ImportFrom):
-        if node.module:
-            self._verify_import(node.module, node.lineno)
-        self.generic_visit(node)
-
-    def _verify_import(self, module_name: str, lineno: int):
-        root_module = module_name.split(".")[0]
-        # Ignore Python stdlib modules
-        if root_module in sys.stdlib_module_names:
-            return
-        # Flag suspicious hallucinated prefixes commonly generated by AI
-        if "hallucinated" in root_module or "turbo_v" in root_module or "fake" in root_module:
-            self.findings.append({
-                "category": "Hallucinated / Unverified Dependency",
-                "cwe": "CWE-1104",
-                "nist_rmf": "MEASURE",
-                "severity": "MEDIUM",
-                "file": self.filepath,
-                "line": lineno,
-                "description": f"Import '{root_module}' flagged as unverified/hallucinated third-party package.",
-                "snippet": self.lines[lineno - 1].strip()
-            })
-
-def scan_text_for_secrets(filepath: str, lines: List[str]) -> List[Dict[str, Any]]:
-    findings = []
-    for idx, line in enumerate(lines, start=1):
-        for pattern_name, regex in SECRET_PATTERNS.items():
-            match = regex.search(line)
-            if match:
-                findings.append({
-                    "category": "Secret Exposure",
-                    "cwe": "CWE-798",
-                    "nist_rmf": "GOVERN",
                     "severity": "CRITICAL",
-                    "file": filepath,
-                    "line": idx,
-                    "description": f"Exposed credential ({pattern_name}) detected in source.",
-                    "snippet": line.strip()
+                    "file": self.filename,
+                    "line": node.lineno,
+                    "description": f"Direct invocation of '{func_name}()' allowing arbitrary execution.",
+                    "snippet": f"{func_name}(...)"
                 })
-    return findings
 
-def audit_file(filepath: str) -> List[Dict[str, Any]]:
-    all_findings = []
+        # 2. Check for os.system(...)
+        elif isinstance(node.func, ast.Attribute):
+            if isinstance(node.func.value, ast.Name) and node.func.value.id == "os" and node.func.attr == "system":
+                self.violations.append({
+                    "category": "OS Command Injection",
+                    "cwe": "CWE-78",
+                    "nist_rmf": "MAP",
+                    "severity": "CRITICAL",
+                    "file": self.filename,
+                    "line": node.lineno,
+                    "description": "Unsanitized system shell invocation via 'os.system()'.",
+                    "snippet": "os.system(...)"
+                })
+
+            # 3. Check for subprocess.call/Popen/run(..., shell=True)
+            elif isinstance(node.func.value, ast.Name) and node.func.value.id == "subprocess":
+                for kw in node.keywords:
+                    if kw.arg == "shell" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
+                        self.violations.append({
+                            "category": "Subprocess Shell Execution",
+                            "cwe": "CWE-78",
+                            "nist_rmf": "MAP",
+                            "severity": "CRITICAL",
+                            "file": self.filename,
+                            "line": node.lineno,
+                            "description": "Subprocess invoked with shell=True, enabling shell injection.",
+                            "snippet": f"subprocess.{node.func.attr}(..., shell=True)"
+                        })
+
+            # 4. Check for cursor.execute() unparameterized query formatting
+            elif node.func.attr == "execute":
+                if node.args:
+                    arg = node.args[0]
+                    # Direct f-string or % or .format() in execute
+                    if isinstance(arg, ast.JoinedStr) or isinstance(arg, ast.BinOp):
+                        self.violations.append({
+                            "category": "SQL Injection",
+                            "cwe": "CWE-89",
+                            "nist_rmf": "MAP",
+                            "severity": "CRITICAL",
+                            "file": self.filename,
+                            "line": node.lineno,
+                            "description": "Direct string interpolation detected in database query execute call.",
+                            "snippet": "cursor.execute(f\"...\")"
+                        })
+
+        self.generic_visit(node)
+
+
+def run_scan(target_path: str):
+    """Parses Python file, traverses AST, outputs CLI report, and saves JSON log."""
+    if not os.path.exists(target_path):
+        print(f"Error: Target path '{target_path}' does not exist.")
+        sys.exit(1)
+
     try:
-        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-            lines = f.readlines()
-            content = "".join(lines)
+        with open(target_path, "r", encoding="utf-8") as f:
+            code_content = f.read()
     except Exception as e:
-        return [{"category": "Read Error", "severity": "LOW", "description": str(e), "file": filepath, "line": 0}]
+        print(f"Error reading file: {e}")
+        sys.exit(1)
 
-    all_findings.extend(scan_text_for_secrets(filepath, lines))
+    try:
+        tree = ast.parse(code_content, filename=target_path)
+    except SyntaxError as e:
+        print(f"[ERROR] SyntaxError while parsing AST: {e}")
+        sys.exit(1)
 
-    if filepath.endswith(".py"):
-        try:
-            tree = ast.parse(content, filename=filepath)
-            scanner = SecurityScanner(filepath, lines)
-            scanner.visit(tree)
-            all_findings.extend(scanner.findings)
-        except SyntaxError:
-            pass
+    scanner = SecurityScanner(filename=target_path)
+    scanner.visit(tree)
+    violations = scanner.violations
 
-    return all_findings
+    # Print CLI stream report
+    print("==================================================")
+    print("  NIST AI RMF 1.0 SECURE CODE GOVERNANCE ENGINE   ")
+    print(f"  Scanned Files: 1  |  Total Flaws: {len(violations)}")
+    print("==================================================\n")
 
-def main():
-    parser = argparse.ArgumentParser(description="AI Pre-Commit Code Governance & Security Guardrail")
-    parser.add_argument("target", help="Path to target file or directory")
-    parser.add_argument("--format", choices=["text", "json"], default="text", help="Output format")
-    args = parser.parse_args()
+    for v in violations:
+        sev = v["severity"]
+        cwe = v["cwe"]
+        nist = v["nist_rmf"]
+        color_code = "\033[91m" if sev == "CRITICAL" else "\033[93m"
+        reset_code = "\033[0m"
 
-    files_to_scan = []
-    if os.path.isfile(args.target):
-        files_to_scan.append(args.target)
-    elif os.path.isdir(args.target):
-        for root, _, files in os.walk(args.target):
-            for file in files:
-                if file.endswith((".py", ".env", ".json", ".txt")):
-                    files_to_scan.append(os.path.join(root, file))
+        print(f"{color_code}[{sev}] {nist} · {v['category']} ({cwe}){reset_code}")
+        print(f"  Location : {v['file']}:{v['line']}")
+        print(f"  Detail   : {v['description']}")
+        print(f"  Code     : {v['snippet']}\n")
 
-    total_findings = []
-    for f in files_to_scan:
-        total_findings.extend(audit_file(f))
+    # Save output to audit_report.json as a direct list of objects
+    report_file = "audit_report.json"
+    with open(report_file, "w", encoding="utf-8") as rf:
+        json.dump(violations, rf, indent=2)
 
-    if args.format == "json":
-        print(json.dumps({"total_scanned": len(files_to_scan), "findings": total_findings}, indent=2))
-        return
+    return len(violations)
 
-    print("=" * 64)
-    print("  NIST AI RMF 1.0 SECURE CODE AUDIT SUMMARY")
-    print(f"  Scanned Files: {len(files_to_scan)}  |  Total Findings: {len(total_findings)}")
-    print("=" * 64)
-
-    if not total_findings:
-        print("\n✔ All governance and security policies passed cleanly.\n")
-        return
-
-    for item in total_findings:
-        color = "\033[91m" if item["severity"] == "CRITICAL" else "\033[93m" if item["severity"] == "HIGH" else "\033[94m"
-        reset = "\033[0m"
-        print(f"\n{color}[{item['severity']}] {item['nist_rmf']} · {item['category']} ({item.get('cwe', 'N/A')}){reset}")
-        print(f"  Location: {item['file']}:{item['line']}")
-        print(f"  Detail  : {item['description']}")
-        print(f"  Code    : {item.get('snippet', '')}")
-
-    print("\n" + "=" * 64)
-    print("Governance Status: BLOCKED (Resolve Critical & High findings before committing)")
-    print("=" * 64 + "\n")
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) < 2:
+        target = "sample_insecure_code.py"
+    else:
+        target = sys.argv[1]
+
+    flaws_count = run_scan(target)
+    sys.exit(1 if flaws_count > 0 else 0)
